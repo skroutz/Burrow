@@ -37,6 +37,7 @@ type BrokerOffset struct {
 
 type ConsumerOffset struct {
 	Offset     int64 `json:"offset"`
+	MaxOffset  int64 `json:"max_offset"`
 	Timestamp  int64 `json:"timestamp"`
 	Lag        int64 `json:"lag"`
 	artificial bool
@@ -328,6 +329,10 @@ func (storage *OffsetStorage) addConsumerOffset(offset *PartitionOffset) {
 
 		// Prevent new commits that are too fast (less than the min-distance config) if the last offset was not artificial
 		if (!lastOffset.artificial) && (timestampDifference >= 0) && (timestampDifference < (storage.app.Config.Lagcheck.MinDistance * 1000)) {
+			// Store the current offset before dropping the ConsumerOffset.
+			// This might be the last offset we receive for a while, and it can help us decide if the consumer is STOPPED because
+			// it has processed all messages.
+			lastOffset.MaxOffset = offset.Offset
 			clusterOffsets.consumerLock.Unlock()
 			log.Debugf("Dropped offset (mindistance): cluster=%s topic=%s partition=%v group=%s timestamp=%v offset=%v tsdiff=%v lag=%v",
 				offset.Cluster, offset.Topic, offset.Partition, offset.Group, offset.Timestamp, offset.Offset,
@@ -348,6 +353,7 @@ func (storage *OffsetStorage) addConsumerOffset(offset *PartitionOffset) {
 	if consumerPartitionRing.Value == nil {
 		consumerPartitionRing.Value = &ConsumerOffset{
 			Offset:     offset.Offset,
+			MaxOffset:  0,
 			Timestamp:  offset.Timestamp,
 			Lag:        partitionLag,
 			artificial: false,
@@ -355,6 +361,7 @@ func (storage *OffsetStorage) addConsumerOffset(offset *PartitionOffset) {
 	} else {
 		ringval, _ := consumerPartitionRing.Value.(*ConsumerOffset)
 		ringval.Offset = offset.Offset
+		ringval.MaxOffset = 0
 		ringval.Timestamp = offset.Timestamp
 		ringval.Lag = partitionLag
 		ringval.artificial = false
@@ -442,6 +449,7 @@ func (storage *OffsetStorage) evaluateGroup(cluster string, group string, result
 			if lastOffset.Offset >= clusterMap.broker[topic][partition].Offset {
 				ringval, _ := offsetRing.Value.(*ConsumerOffset)
 				ringval.Offset = lastOffset.Offset
+				ringval.MaxOffset = 0
 				ringval.Timestamp = time.Now().Unix() * 1000
 				ringval.Lag = 0
 				ringval.artificial = true
@@ -449,6 +457,20 @@ func (storage *OffsetStorage) evaluateGroup(cluster string, group string, result
 
 				log.Tracef("Artificial offset: cluster=%s topic=%s partition=%v group=%s timestamp=%v offset=%v lag=0",
 					cluster, topic, partition, group, ringval.Timestamp, lastOffset.Offset)
+
+				// Add an artificial offset commit if the consumer has no lag against the current broker offset
+				// This time we check the maxOffset seen in the last window (piggybacked in the ConsumerOffset).
+			} else if lastOffset.MaxOffset >= clusterMap.broker[topic][partition].Offset {
+				ringval, _ := offsetRing.Value.(*ConsumerOffset)
+				ringval.Offset = lastOffset.MaxOffset
+				ringval.MaxOffset = 0
+				ringval.Timestamp = time.Now().Unix() * 1000
+				ringval.Lag = 0
+				ringval.artificial = true
+				partitions[partition] = partitions[partition].Next()
+
+				log.Tracef("Artificial max offset: cluster=%s topic=%s partition=%v group=%s timestamp=%v offset=%v max_offset=%v lag=0",
+					cluster, topic, partition, group, ringval.Timestamp, lastOffset.Offset, lastOffset.MaxOffset)
 			}
 
 			// Pull out the offsets once so we can unlock the map
